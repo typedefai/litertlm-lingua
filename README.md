@@ -19,6 +19,11 @@ Built on Google LiteRT-LM + MediaPipe, targeting the Xiaomi 14 Pro (Snapdragon 8
 - **Wordbook** — star words to collect them; reopen, pronounce, or remove from the list.
 - **Practice** — chat with Lily, an English-tutor persona. She replies in simple English,
   gently corrects mistakes, and speaks while still generating. New-chat resets the conversation.
+- **Voice control** — in the chat, just ask: "look up the word *schedule*", "add *apple* to my
+  list", "remove *banana*", "what words have I saved", "translate 今天天气很好", "how do you
+  pronounce *comfortable*". Lily calls on-device tools (visible as expandable tool-call cards):
+  dictionary lookups open the Dictionary tab, translations fill the Translate tab, and
+  pronunciations play out loud.
 
 ## Models
 

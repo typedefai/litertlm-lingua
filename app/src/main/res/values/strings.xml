@@ -79,7 +79,15 @@
     <string name="practice_empty_title">Let\'s talk in English</string>
     <string name="practice_empty_hint">Hold the mic and speak, or type a message. Lily will reply and speak to you.</string>
     <string name="practice_message_hint">Message Lily…</string>
-    <string name="tutor_welcome_fallback">Hi! I\'m Lily. Let\'s practice English together — say anything you like.</string>
+    <string name="tutor_welcome_fallback">Hi! I\'m Lily. Let\'s practice English together — I can also look up words, save them to your word list, translate sentences, and pronounce words for you.</string>
+
+    <!-- Tool calls -->
+    <string name="llm_tool_parse_error">Lily produced an invalid tool call twice. Please rephrase or try again.</string>
+    <string name="tool_call_title">Tool call · %1$s</string>
+    <string name="tool_call_arguments">Arguments</string>
+    <string name="tool_call_result">Result</string>
+    <string name="tool_call_collapse">Collapse</string>
+    <string name="tool_call_expand">Expand</string>
 
     <!-- Chat -->
     <string name="you">You</string>

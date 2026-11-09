@@ -78,6 +78,12 @@ class SpeechChunker(
     return text
   }
 
+  /** Drops all buffered text (used when a stream turns out to be a tool call, not prose). */
+  fun reset() {
+    buffer.clear()
+    emittedChunk = false
+  }
+
   private fun isBoundary(char: Char, index: Int): Boolean {
     val boundary = char == '.' || char == ',' || char == '!' || char == '?' ||
       char == ';' || char == ':' || char == '\n' ||

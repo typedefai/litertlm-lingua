@@ -15,6 +15,8 @@ import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
+import com.google.ai.edge.litertlm.ToolCall
+import com.google.ai.edge.litertlm.ToolProvider
 import com.typedefai.lingua.settings.LlmSettings
 import java.io.File
 import java.util.concurrent.Executors
@@ -29,6 +31,7 @@ data class LlmResult(
   val outputTokens: Int,
   val decodeSpeedTps: Double,
   val ttftMs: Long,
+  val toolCalls: List<ToolCall> = emptyList(),
 )
 
 /**
@@ -49,6 +52,7 @@ class LlmEngine(
   private val settings: LlmSettings = LlmSettings.DEFAULT,
   private val modelFileName: String = DEFAULT_MODEL_FILE,
   private val systemInstruction: String = "",
+  private val tools: List<ToolProvider> = emptyList(),
 ) : AutoCloseable {
 
   private val dispatcher = Executors.newSingleThreadExecutor { runnable ->
@@ -68,58 +72,116 @@ class LlmEngine(
   /**
    * Sends [prompt] to the persistent chat conversation and streams the assistant text through
    * [onUpdate]. The conversation survives across calls so Gemma sees the chat history.
+   *
+   * When LiteRT reports a malformed tool call (Gemma wrapped its call in a JSON fence), the
+   * conversation is reset and the prompt retried once; a second failure propagates.
    */
   @OptIn(ExperimentalApi::class)
   suspend fun generate(prompt: String, onUpdate: (String) -> Unit): LlmResult =
     withContext(dispatcher) {
-      val activeConversation = ensureConversation()
       try {
-        val startedAt = SystemClock.elapsedRealtime()
-        var firstPartial = true
-        val builder = StringBuilder()
-        activeConversation.sendMessageAsync(Contents.of(prompt)).collect { message: Message ->
-          val snapshot = synchronized(builder) {
-            builder.append(message.toString())
-            builder.toString()
-          }
-          if (snapshot.isNotBlank()) {
-            if (firstPartial) {
-              firstPartial = false
-              Log.d(
-                TRACE,
-                "LLM first partial after ${SystemClock.elapsedRealtime() - startedAt} ms " +
-                  "(${snapshot.length} chars)",
-              )
-            }
-            runCatching { onUpdate(snapshot) }
-          }
-        }
-        val text = synchronized(builder) { builder.toString() }
-        val benchmark = runCatching { activeConversation.getBenchmarkInfo() }.getOrNull()
-        Log.d(
-          TRACE,
-          "LLM generation complete after ${SystemClock.elapsedRealtime() - startedAt} ms " +
-            "(chars=${text.length}, tokens=${benchmark?.lastDecodeTokenCount ?: 0}, " +
-            "speed=${benchmark?.lastDecodeTokensPerSecond ?: 0.0})",
-        )
-        LlmResult(
-          text = text,
-          outputTokens = benchmark?.lastDecodeTokenCount ?: 0,
-          decodeSpeedTps = benchmark?.lastDecodeTokensPerSecond ?: 0.0,
-          ttftMs = ((benchmark?.timeToFirstTokenInSecond ?: 0.0) * 1_000.0).toLong(),
-        )
+        generateOnce(prompt, onUpdate)
       } catch (t: Throwable) {
-        if (t is CancellationException) {
-          runCatching { activeConversation.cancelProcess() }
-        } else {
-          runCatching { activeConversation.close() }
-          if (conversation === activeConversation) {
-            conversation = null
-          }
-        }
-        throw t
+        if (!isToolCallParseError(t)) throw t
+        Log.w(TRACE, "Tool-call parse failed; resetting the conversation and retrying once", t)
+        runCatching { conversation?.close() }
+        conversation = null
+        generateOnce(prompt, onUpdate)
       }
     }
+
+  @OptIn(ExperimentalApi::class)
+  private suspend fun generateOnce(prompt: String, onUpdate: (String) -> Unit): LlmResult {
+    val activeConversation = ensureConversation()
+    try {
+      val startedAt = SystemClock.elapsedRealtime()
+      var firstPartial = true
+      val builder = StringBuilder()
+      var lastMessage: Message? = null
+      activeConversation.sendMessageAsync(Contents.of(prompt)).collect { message: Message ->
+        lastMessage = message
+        val snapshot = synchronized(builder) {
+          builder.append(message.toString())
+          builder.toString()
+        }
+        if (snapshot.isNotBlank()) {
+          if (firstPartial) {
+            firstPartial = false
+            Log.d(
+              TRACE,
+              "LLM first partial after ${SystemClock.elapsedRealtime() - startedAt} ms " +
+                "(${snapshot.length} chars)",
+            )
+          }
+          runCatching { onUpdate(snapshot) }
+        }
+      }
+      val text = synchronized(builder) { builder.toString() }
+      val benchmark = runCatching { activeConversation.getBenchmarkInfo() }.getOrNull()
+      Log.d(
+        TRACE,
+        "LLM generation complete after ${SystemClock.elapsedRealtime() - startedAt} ms " +
+          "(chars=${text.length}, tokens=${benchmark?.lastDecodeTokenCount ?: 0}, " +
+          "speed=${benchmark?.lastDecodeTokensPerSecond ?: 0.0}, " +
+          "toolCalls=${lastMessage?.toolCalls?.size ?: 0})",
+      )
+      LlmResult(
+        text = text,
+        outputTokens = benchmark?.lastDecodeTokenCount ?: 0,
+        decodeSpeedTps = benchmark?.lastDecodeTokensPerSecond ?: 0.0,
+        ttftMs = ((benchmark?.timeToFirstTokenInSecond ?: 0.0) * 1_000.0).toLong(),
+        toolCalls = lastMessage?.toolCalls.orEmpty(),
+      )
+    } catch (t: Throwable) {
+      if (t is CancellationException) {
+        runCatching { activeConversation.cancelProcess() }
+      } else {
+        runCatching { activeConversation.close() }
+        if (conversation === activeConversation) {
+          conversation = null
+        }
+      }
+      throw t
+    }
+  }
+
+  /**
+   * Feeds tool results back into the conversation and streams the follow-up assistant text.
+   */
+  @OptIn(ExperimentalApi::class)
+  suspend fun sendToolResponse(
+    contents: Contents,
+    onUpdate: (String) -> Unit,
+  ): LlmResult = withContext(dispatcher) {
+    val activeConversation = ensureConversation()
+    val startedAt = SystemClock.elapsedRealtime()
+    val builder = StringBuilder()
+    var lastMessage: Message? = null
+    activeConversation.sendMessageAsync(Message.tool(contents)).collect { message: Message ->
+      lastMessage = message
+      val snapshot = synchronized(builder) {
+        builder.append(message.toString())
+        builder.toString()
+      }
+      if (snapshot.isNotBlank()) {
+        runCatching { onUpdate(snapshot) }
+      }
+    }
+    val text = synchronized(builder) { builder.toString() }
+    val benchmark = runCatching { activeConversation.getBenchmarkInfo() }.getOrNull()
+    Log.d(
+      TRACE,
+      "LLM tool follow-up after ${SystemClock.elapsedRealtime() - startedAt} ms " +
+        "(chars=${text.length}, tokens=${benchmark?.lastDecodeTokenCount ?: 0})",
+    )
+    LlmResult(
+      text = text,
+      outputTokens = benchmark?.lastDecodeTokenCount ?: 0,
+      decodeSpeedTps = benchmark?.lastDecodeTokensPerSecond ?: 0.0,
+      ttftMs = ((benchmark?.timeToFirstTokenInSecond ?: 0.0) * 1_000.0).toLong(),
+      toolCalls = lastMessage?.toolCalls.orEmpty(),
+    )
+  }
 
   /**
    * Streams a one-shot translation in a fresh conversation with a greedy sampler (deterministic,
@@ -251,6 +313,8 @@ class LlmEngine(
         ),
         maxOutputToken = settings.maxOutputTokens,
         thinkingConfig = ThinkingConfig(false),
+        tools = tools,
+        automaticToolCalling = false,
       ),
     )
     conversation = created
@@ -303,6 +367,15 @@ class LlmEngine(
     return dirs.asSequence()
       .map { File(it, modelFileName) }
       .firstOrNull { it.isFile }
+  }
+
+  private fun isToolCallParseError(t: Throwable): Boolean {
+    val text = generateSequence(t) { it.cause }
+      .mapNotNull { it.message }
+      .joinToString(" ")
+      .lowercase()
+    return text.contains("failed to parse tool calls") ||
+      (text.contains("status code 3") && text.contains("tool"))
   }
 
   override fun close() {

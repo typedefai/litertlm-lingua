@@ -126,6 +126,11 @@ fun PracticeScreen(viewModel: AppViewModel) {
         verticalArrangement = Arrangement.spacedBy(14.dp),
       ) {
         items(messages, key = { it.id }) { message ->
+          val call = message.toolCall
+          if (call != null) {
+            ToolCallCard(call)
+            return@items
+          }
           MessageBubble(
             message = message,
             onStopSpeaking = viewModel::stopSpeaking,

@@ -8,6 +8,9 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.tool
 import com.typedefai.lingua.asr.AsrEngine
 import com.typedefai.lingua.asr.PcmRecorder
 import com.typedefai.lingua.dict.DictEntry
@@ -22,6 +25,14 @@ import com.typedefai.lingua.lingua.EXPLAIN_WORD_SYSTEM
 import com.typedefai.lingua.lingua.TRANSLATE_SYSTEM
 import com.typedefai.lingua.lingua.TUTOR_SYSTEM
 import com.typedefai.lingua.lingua.TUTOR_WELCOME_SYSTEM
+import com.typedefai.lingua.lingua.agent.AddToWordbookTool
+import com.typedefai.lingua.lingua.agent.ListWordbookTool
+import com.typedefai.lingua.lingua.agent.LookupWordTool
+import com.typedefai.lingua.lingua.agent.PronounceWordTool
+import com.typedefai.lingua.lingua.agent.RemoveFromWordbookTool
+import com.typedefai.lingua.lingua.agent.ToolExecutor
+import com.typedefai.lingua.lingua.agent.ToolResult
+import com.typedefai.lingua.lingua.agent.TranslateTextTool
 import com.typedefai.lingua.llm.LlmEngine
 import com.typedefai.lingua.settings.AppSettings
 import com.typedefai.lingua.settings.AudioSettings
@@ -79,6 +90,13 @@ enum class ChatRole {
   Assistant,
 }
 
+/** Audit row for one tool invocation in the practice chat. */
+data class ToolCallInfo(
+  val name: String,
+  val arguments: String,
+  val resultJson: String? = null,
+)
+
 data class ChatMessage(
   val id: Long,
   val role: ChatRole,
@@ -89,6 +107,7 @@ data class ChatMessage(
   val outputTokens: Int? = null,
   val decodeSpeedTps: Float? = null,
   val ttftMs: Long? = null,
+  val toolCall: ToolCallInfo? = null,
 )
 
 /** State of the Translate tab. */
@@ -140,8 +159,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
   private val _settings = MutableStateFlow(settingsStore.load())
   val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
+  /** Word/translation tools Gemma can call in the practice chat (manual tool loop). */
+  private val wordTools = listOf(
+    tool(LookupWordTool()),
+    tool(AddToWordbookTool()),
+    tool(RemoveFromWordbookTool()),
+    tool(ListWordbookTool()),
+    tool(TranslateTextTool()),
+    tool(PronounceWordTool()),
+  )
+
   private var asr = AsrEngine(application, _settings.value.audio.asrModel)
-  private var llm = LlmEngine(application, _settings.value.llm, systemInstruction = TUTOR_SYSTEM)
+  private var llm = LlmEngine(
+    application,
+    _settings.value.llm,
+    systemInstruction = TUTOR_SYSTEM,
+    tools = wordTools,
+  )
   private var tts: SpeechEngine = createTts(_settings.value.audio)
   private var zhTts: SystemTtsEngine? = null
 
@@ -188,9 +222,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
   private var nextMessageId = 0L
 
   init {
+    ToolExecutor.init(dict, wordbook) { text, target -> translateForTool(text, target) }
     viewModelScope.launch {
       loadModels()
     }
+  }
+
+  /** One-shot translation used by the `translate_text` tool (runs on Gemma's dispatcher). */
+  private suspend fun translateForTool(text: String, target: Lang): String? {
+    val prompt = when (target) {
+      Lang.ZH ->
+        "Translate the following ${if (detectLang(text) == Lang.EN) "English" else "Chinese"} " +
+          "text into Simplified Chinese:\n\n$text"
+      Lang.EN -> "Translate the following Chinese text into English:\n\n$text"
+    }
+    return runCatching {
+      llm.translate(TRANSLATE_SYSTEM, prompt, maxOutputTokens = 512) { }.text
+    }.getOrNull()?.trim()?.takeIf { it.isNotBlank() }
   }
 
   // ---------------------------------------------------------------- startup
@@ -356,7 +404,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (llmChanged) {
           closeEngine("Gemma") { llm.close() }
-          llm = LlmEngine(app, newSettings.llm, systemInstruction = TUTOR_SYSTEM)
+          llm = LlmEngine(app, newSettings.llm, systemInstruction = TUTOR_SYSTEM, tools = wordTools)
         }
 
         loadModels(
@@ -837,27 +885,95 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     val chunker = SpeechChunker()
     var lastPartialLength = 0
+    var toolRounds = 0
+    var lastToolResult: ToolResult? = null
     val result = runCatching {
-      llm.generate(prompt) { partial ->
-        val delta = if (partial.length >= lastPartialLength) {
-          partial.substring(lastPartialLength)
-        } else {
-          partial
-        }
-        lastPartialLength = partial.length
-        if (delta.isNotBlank()) {
-          updateAssistant(assistantId, partial.trim(), isStreaming = true)
+      var current = llm.generate(prompt) { partial ->
+        val clean = stripToolCallJson(partial)
+        if (clean.isNotBlank()) {
+          updateAssistant(assistantId, clean, isStreaming = true)
           _state.compareAndSet(AssistantState.Thinking, AssistantState.Responding)
-          chunker.append(delta).forEach { speechQueue.trySend(it) }
+        }
+        // Feed the first pass to TTS only while it stays prose. The moment tool-call syntax
+        // appears, stop the feed and drop the buffered text so no JSON is ever spoken.
+        if (clean != partial) {
+          toolRounds = -1 // signal: this pass turned into a tool call
+          chunker.reset()
+        }
+        if (toolRounds >= 0) {
+          val delta = if (partial.length >= lastPartialLength) {
+            partial.substring(lastPartialLength)
+          } else {
+            partial
+          }
+          lastPartialLength = partial.length
+          if (delta.isNotBlank()) {
+            chunker.append(delta).forEach { speechQueue.trySend(it) }
+          }
         }
       }
+      if (toolRounds < 0) toolRounds = 0
+
+      while (current.toolCalls.isNotEmpty() && toolRounds < MAX_TOOL_ROUNDS) {
+        toolRounds++
+        updateAssistant(assistantId, "", isStreaming = true)
+        val responses = mutableListOf<Content>()
+        for (call in current.toolCalls) {
+          val params = org.json.JSONObject()
+          for ((key, value) in call.arguments) {
+            params.put(key, value)
+          }
+          val argsJson = params.toString()
+          val toolResult = withContext(Dispatchers.IO) {
+            ToolExecutor.execute(call.name, params)
+          }
+          lastToolResult = toolResult
+          applyToolSideEffects(toolResult, speechQueue)
+          val resultJson = ToolExecutor.toolResponseJson(toolResult)
+          _messages.update {
+            it + ChatMessage(
+              id = nextMessageId++,
+              role = ChatRole.Assistant,
+              text = "",
+              toolCall = ToolCallInfo(
+                name = call.name,
+                arguments = argsJson,
+                resultJson = resultJson,
+              ),
+            )
+          }
+          responses += Content.ToolResponse(call.name, resultJson)
+        }
+
+        var lastCleanLength = 0
+        current = llm.sendToolResponse(Contents.of(responses)) { partial ->
+          val clean = stripToolCallJson(partial)
+          val delta = if (clean.length >= lastCleanLength) {
+            clean.substring(lastCleanLength)
+          } else {
+            clean
+          }
+          lastCleanLength = clean.length
+          if (delta.isNotBlank()) {
+            updateAssistant(assistantId, clean.trim(), isStreaming = true)
+            _state.compareAndSet(AssistantState.Thinking, AssistantState.Responding)
+            chunker.append(delta).forEach { speechQueue.trySend(it) }
+          }
+        }
+      }
+      current to lastToolResult
     }
 
+    val output = result.getOrNull()?.first
+    var reply = stripToolCallJson(output?.text.orEmpty()).trim()
+    if (reply.isBlank() && toolRounds > 0) {
+      // The model produced no prose after the tool rounds: narrate deterministically.
+      reply = fallbackToolNarration(lastToolResult)
+      chunker.append(reply).forEach { speechQueue.trySend(it) }
+    }
     chunker.flush().takeIf { it.isNotBlank() }?.let { speechQueue.trySend(it) }
     speechQueue.close()
 
-    val output = result.getOrNull()
-    val reply = output?.text?.trim().orEmpty()
     if (result.isSuccess && reply.isNotBlank()) {
       updateAssistant(
         id = assistantId,
@@ -873,7 +989,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         updateAssistant(
           id = assistantId,
           text = if (error != null) {
-            app.getString(R.string.llm_failed, error.message ?: "unknown error")
+            val message = error.message.orEmpty()
+            if (message.contains("failed to parse tool calls", ignoreCase = true)) {
+              app.getString(R.string.llm_tool_parse_error)
+            } else {
+              app.getString(R.string.llm_failed, message.ifBlank { "unknown error" })
+            }
           } else {
             app.getString(R.string.no_response)
           },
@@ -898,6 +1019,113 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
       "practice turn finished after ${SystemClock.elapsedRealtime() - turnStart} ms " +
         "(chars=${reply.length}, tokens=${output?.outputTokens ?: 0})",
     )
+  }
+
+  // ---------------------------------------------------------------- tool plumbing
+
+  /**
+   * Visible effects of a tool call, applied while the tool loop is still running:
+   * dictionary lookups open the Dictionary tab, translations fill the Translate tab,
+   * pronunciations are queued into the running speech stream, and wordbook changes
+   * refresh the saved-word list.
+   */
+  private suspend fun applyToolSideEffects(
+    result: ToolResult,
+    speechQueue: Channel<String>,
+  ) {
+    when (result) {
+      is ToolResult.Lookup -> {
+        val entry = result.entry
+        if (entry != null) {
+          _tab.value = LinguaTab.Dictionary
+          _dictionary.update {
+            it.copy(
+              query = entry.word,
+              entry = entry,
+              suggestions = emptyList(),
+              chineseResults = emptyList(),
+              searched = true,
+              isSaved = wordbook.contains(entry.word),
+              explanation = "",
+              explaining = false,
+              note = null,
+            )
+          }
+        }
+      }
+      is ToolResult.Translation -> {
+        _tab.value = LinguaTab.Translate
+        _translate.update {
+          it.copy(
+            mode = TranslateMode.AUTO,
+            input = result.source,
+            output = result.text,
+            sourceLang = detectLang(result.source),
+            targetLang = result.target,
+            busy = false,
+            error = null,
+            note = null,
+            isSpeaking = false,
+            explanation = "",
+            explaining = false,
+          )
+        }
+      }
+      is ToolResult.Pronounce -> {
+        // Queued ahead of the narration so the word plays first, in the same audio stream.
+        speechQueue.trySend(result.word)
+      }
+      is ToolResult.WordbookChanged,
+      is ToolResult.WordbookList -> refreshSavedWords()
+      else -> Unit
+    }
+  }
+
+  /** Deterministic narration when Gemma ends a tool round with no prose. */
+  private fun fallbackToolNarration(result: ToolResult?): String = when (result) {
+    is ToolResult.Lookup -> {
+      val entry = result.entry
+      if (entry != null) {
+        val senses = entry.translationLines.take(3).joinToString("; ")
+        "${entry.word}: $senses"
+      } else {
+        "I couldn't find \"${result.word}\" in the dictionary. Please check the spelling."
+      }
+    }
+    is ToolResult.WordbookChanged ->
+      if (result.added) {
+        "Added \"${result.word}\" to your wordbook."
+      } else {
+        "Removed \"${result.word}\" from your wordbook."
+      }
+    is ToolResult.WordbookList ->
+      if (result.words.isEmpty()) {
+        "Your wordbook is empty."
+      } else {
+        val preview = result.words.take(5).joinToString(", ") { it.word }
+        "Your wordbook has ${result.words.size} words: $preview."
+      }
+    is ToolResult.Translation -> result.text
+    is ToolResult.Pronounce -> "\"${result.word}\""
+    is ToolResult.ValidationError -> result.message
+    is ToolResult.Error -> result.message
+    else -> "Done."
+  }
+
+  /** Cuts streamed text at the first tool-call marker so no tool JSON reaches the UI or TTS. */
+  private fun stripToolCallJson(text: String): String {
+    val markers = listOf(
+      "<|",
+      "```json",
+      "*Tool call:",
+      "Tool call:",
+      "\"tool_calls\"",
+      "\"name\":",
+    )
+    val cut = markers.map { marker -> text.indexOf(marker, ignoreCase = true) }
+      .filter { it >= 0 }
+      .minOrNull() ?: return text
+    return text.substring(0, cut).trimEnd()
   }
 
   // ---------------------------------------------------------------- speech plumbing
@@ -1049,5 +1277,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     const val TAG = "AppViewModel"
     const val TRACE = "VoiceTrace"
     const val RELOAD_WATCHDOG_MS = 90_000L
+    const val MAX_TOOL_ROUNDS = 3
   }
 }
